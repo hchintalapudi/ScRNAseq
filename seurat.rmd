@@ -1,0 +1,165 @@
+library(dplyr)
+library(Seurat)
+library(patchwork)
+library("sctransform")
+library("multtest")
+library("multtest")
+library("clustree")
+library("IKAP")
+
+rna_10x<- Read10X(data.dir = "/Users/hchintalapudi/Desktop/ScRNA/10x_GEX_10-6-20/Ptf1a_1/outs/filtered_feature_bc_matrix/")
+rna<- CreateSeuratObject(counts = rna_10x, project = "10x_scrna", min.cells = 3, min.features = 200)
+rna
+
+# The [[ operator can add columns to object metadata. This is a great place to stash QC stats
+rna[["percent.mt"]] <- PercentageFeatureSet(rna, pattern = "^mt-")
+
+# Show QC metrics for the first 5 cells
+head(rna@meta.data, 5)
+
+##  Calculating proportion of reads mapping to mitochondrial transcripts: https://github.com/hbctraining/scRNA-seq/blob/master/lessons/mitoRatio.md
+
+# Visualize QC metrics as a violin plot
+VlnPlot(rna, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+
+# FeatureScatter is typically used to visualize feature-feature relationships, but can be used
+# for anything calculated by the object, i.e. columns in object metadata, PC scores etc.
+
+plot1 <- FeatureScatter(rna, feature1 = "nCount_RNA", feature2 = "percent.mt")
+plot2 <- FeatureScatter(rna, feature1 = "nCount_RNA", feature2 = "nFeature_RNA")
+plot1 + plot2
+
+
+
+rna <- subset(rna, subset = nFeature_RNA > 200 & nFeature_RNA < 4500 & percent.mt < 10)
+FeatureScatter(rna, feature1 = "nCount_RNA", feature2 = "nFeature_RNA")
+
+#rna <- NormalizeData(rna, normalization.method = "LogNormalize", scale.factor = 10000)
+#rna<- NormalizeData(rna)
+
+#rna<- FindVariableFeatures(rna, selection.method = "vst", nfeatures = 2000)
+
+
+# run sctransform
+rna <- SCTransform(rna, vars.to.regress = "percent.mt", verbose = FALSE)
+
+
+VlnPlot(object = rna, features = c( "percent.mt"))
+
+# Identify the 10 most highly variable genes
+#top10 <- head(VariableFeatures(rna), 10)
+
+# plot variable features with and without labels
+#plot1 <- VariableFeaturePlot(rna)
+#plot2 <- LabelPoints(plot = plot1, points = top10, repel = TRUE)
+#plot1 + plot2
+
+#all.genes <- rownames(rna)
+#rna <- ScaleData(rna, features = all.genes)
+
+#rna <- RunPCA(rna, features = VariableFeatures(object = rna))
+rna<- RunPCA(rna, verbose = T)
+rna <- RunUMAP(rna, dims = 1:30, verbose = FALSE)
+rna<- RunTSNE(rna, dims = 1:30, verbose = FALSE)
+
+rna <- FindNeighbors(rna, dims = 1:30, verbose = FALSE)
+experiment.aggregate <- FindClusters(
+    object = rna, 
+    resolution = seq(0.25,4,0.25), 
+    verbose = FALSE
+)
+#Lets first investigate how many clusters each resolution produces
+
+sapply(grep("res",colnames(experiment.aggregate@meta.data),value = TRUE),
+       function(x) length(unique(experiment.aggregate@meta.data[,x])))
+
+
+clustree(experiment.aggregate)
+DimPlot(rna, label = TRUE, reduction = "umap") + NoLegend()
+DimPlot(rna_0.25, label = TRUE) + NoLegend()
+# Look at cluster IDs of the first 5 cells
+head(Idents(rna), 5)
+
+#DimPlot(rna, reduction = "pca")
+
+DimHeatmap(rna, dims = 1, cells = 500, balanced = TRUE)
+DimHeatmap(rna, dims = 1:15, cells = 500, balanced = TRUE)
+
+
+# NOTE: This process can take a long time for big datasets, comment out for expediency. More
+# approximate techniques such as those implemented in ElbowPlot() can be used to reduce
+# computation time
+
+#!!!!Unfortunately the JackStraw procedure as implemented does not work well on SCT-transformed data. This is because JackStraw, as we implemented it, assumes each gene has equal variance - this is not true for SCT normalization (where gene variance is weighted by biological heterogenetiy). We are disabling the ability to perform JackStraw on SCT-normalized data -> https://github.com/satijalab/seurat/issues/1871
+#rna <- JackStraw(rna, num.replicate = 100)
+#rna <- ScoreJackStraw(rna, dims = 1:20)
+
+## if PC p values are 0, they're probably samller than 0 and R is not interpreting them.
+#JackStrawPlot(rna, dims = 1:15)
+
+ElbowPlot(rna, ndims = 30)
+
+
+
+
+
+# note that you can set `label = TRUE` or use the LabelClusters function to help label
+# individual clusters
+DimPlot(rna, reduction = "umap")
+DimPlot(rna, reduction = "tsne", label = TRUE, pt.size = 0.5)
+
+
+
+# find markers for every cluster compared to all remaining cells, report only the positive ones
+rna.markers <- FindAllMarkers(rna, min.pct = 0.25, logfc.threshold = 0.25, min.diff.pct = 0.25, only.pos = T)
+# find conserved markers for every cluster for identifying only those genes the are significantly differentially expressed relative to the other clusters for all conditions. This function is most useful to run if unsure of the identity for a cluster after running the FindAllMarkers()
+#FindConservedMarkers(seurat_obj,ident.1 = cluster,grouping.var = "group",only.pos = TRUE)
+
+# Create function to get conserved markers for any given cluster
+get_conserved <- function(cluster){
+        FindConservedMarkers(rna,
+                             ident.1 = cluster,
+                             grouping.var = "sample",
+                             only.pos = TRUE) %>%
+                rownames_to_column(var = "gene") %>%
+                cbind(cluster_id = cluster, .)
+}
+
+#map_dfr(inputs_to_function, name_of_function)
+# Iterate function across desired clusters
+#rna.conserved_markers <- map_dfr(c(0:11), get_conserved)
+
+
+dr_gtf<- rtracklayer::readGFF("/Users/hchintalapudi/Desktop/DartFish/Danio_rerio.GRCz11.101.gtf.gz")
+rna.markers_genes<- as.data.frame(unique(rna.markers$gene))
+rna.markers_genes<- left_join(rna.markers_genes, dr_gtf[,c("gene_id", "gene_name", "gene_biotype")], by = c("unique(rna.markers$gene)" = "gene_name"))
+colnames(rna.markers_genes)[1]<- "gene"
+rna.markers_genes<- rna.markers_genes%>%
+  group_by(gene)%>%
+  dplyr::slice(1)
+rna.markers_genes<- left_join(rna.markers_genes, zf_human_homologs.2[,c(1,3,4)], by= c("gene" = "Gene.name"))
+rna.markers<- left_join(rna.markers, rna.markers_genes, by = "gene")
+
+
+colnames(rna.markers)[10]<- "h_homolog gene name"
+colnames(rna.markers)[11]<- "h_homolog gene_id"
+
+rna.markers<- rna.markers[,c(6:11, 1:5)]
+
+# Return top 10 markers for cluster specified 'x'
+gen_marker_table <- function(x){
+  rna.markers[rna.markers$cluster == x, ] %>%
+  head(n=10)
+}
+
+# Create a data frame of results for clusters 0-12
+top10_markers <- map_dfr(0:12, gen_marker_table)
+top10_markers_by.lfc<- rna.markers %>%group_by(cluster) %>%top_n(n = 10,wt = avg_logFC)
+
+top10_markers<- left_join(top10_markers, rna.markers_genes, by = "gene")
+colnames(top10_markers)[10]<- "h_homolog gene name"
+colnames(top10_markers)[11]<- "h_homolog gene_id"
+top10_markers<- top10_markers[,c(6:11, 1:5)]
+
+FeaturePlot(object = rna, features = c(top10_markers[top10_markers$cluster == 5, "gene"]), cols = c("grey", "blue"), reduction = "umap")
+FeaturePlot(object = rna, features = c(top10_markers_by.lfc[top10_markers_by.lfc$cluster == 8, "gene"]), cols = c("grey", "blue"), reduction = "umap")
